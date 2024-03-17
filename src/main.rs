@@ -1,9 +1,10 @@
 use anyhow::Context;
 use clap::Parser;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::{
+pub(crate) use tokio::{
     fs::File,
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::BufStream,
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
@@ -52,7 +53,17 @@ impl HttpError {
         }
     }
 
-    pub async fn write_to_stream(&self, stream: &mut TcpStream) -> anyhow::Result<()> {
+    pub fn method_not_allowed(method: &str) -> Self {
+        Self {
+            status_code: 405,
+            error: anyhow::anyhow!("Method {method} not allowed"),
+        }
+    }
+
+    pub async fn write_to_stream(
+        &self,
+        stream: &mut (impl AsyncWrite + Unpin),
+    ) -> anyhow::Result<()> {
         write_string_response(stream, self.status_code, &[], Some(&self.error.to_string()))
             .await
             .context("writing http error to stream")
@@ -71,13 +82,13 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => spawn_handler(stream, base_dir.clone()),
+            Ok((stream, _)) => spawn_handler(BufStream::new(stream), base_dir.clone()),
             Err(e) => println!("error occurred during setting up the connection: {e}"),
         }
     }
 }
 
-fn spawn_handler(stream: TcpStream, base_dir: Arc<PathBuf>) {
+fn spawn_handler(stream: BufStream<TcpStream>, base_dir: Arc<PathBuf>) {
     tokio::spawn(async move {
         let mut stream = stream;
         if let Err(e) = handle_request(&mut stream, base_dir).await {
@@ -88,28 +99,50 @@ fn spawn_handler(stream: TcpStream, base_dir: Arc<PathBuf>) {
     });
 }
 
-async fn handle_request(stream: &mut TcpStream, base_dir: Arc<PathBuf>) -> Result<(), HttpError> {
+async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut BufStream<S>,
+    base_dir: Arc<PathBuf>,
+) -> Result<(), HttpError> {
     println!("accepted new connection");
 
-    let mut request = [0; 1024];
-    stream.read(&mut request).await.context("reading request")?;
+    let mut request_line = String::new();
+    stream
+        .read_line(&mut request_line)
+        .await
+        .context("reading request line")?;
 
-    let request = String::from_utf8_lossy(&request);
+    let mut request_line_parts = request_line.trim().splitn(3, ' ');
+    let method = request_line_parts
+        .next()
+        .ok_or_else(|| HttpError::bad_request("no method found in header"))?;
 
-    println!("read data");
+    let path = request_line_parts
+        .next()
+        .ok_or_else(|| HttpError::bad_request("no path found in header"))?;
 
-    let (start_line, rest) = request
-        .split_once("\r\n")
-        .ok_or_else(|| HttpError::bad_request("request header does not contain newline"))?;
+    let standard = request_line_parts
+        .next()
+        .ok_or_else(|| HttpError::bad_request("no standard found in header"))?;
 
-    let (headers, _body) = rest.split_once("\r\n\r\n").ok_or_else(|| {
-        HttpError::bad_request("request doesn't have a proper split between headers and body")
-    })?;
+    println!("Incoming request: {method} {path} [{standard}]");
 
-    let path = start_line
-        .splitn(3, ' ')
-        .nth(1)
-        .ok_or_else(|| HttpError::bad_request("request doesn't have a path"))?;
+    let mut headers = HashMap::new();
+    loop {
+        let mut header_line = String::new();
+        stream
+            .read_line(&mut header_line)
+            .await
+            .context("reading header line")?;
+
+        if header_line.trim().is_empty() {
+            break;
+        }
+
+        let (k, v) = header_line
+            .split_once(':')
+            .ok_or_else(|| HttpError::bad_request("invalid header format"))?;
+        headers.insert(k.trim().to_owned(), v.trim().to_owned());
+    }
 
     if path == "/" {
         write_string_response(stream, 200, &[], None).await?;
@@ -127,10 +160,6 @@ async fn handle_request(stream: &mut TcpStream, base_dir: Arc<PathBuf>) -> Resul
         )
         .await?;
     } else if path == "/user-agent" {
-        let headers = headers
-            .split("\r\n")
-            .filter_map(|header| header.split_once(": "))
-            .collect::<HashMap<_, _>>();
         let user_agent = headers
             .get("User-Agent")
             .ok_or_else(|| HttpError::bad_request("no user agent header in request"))?;
@@ -146,20 +175,33 @@ async fn handle_request(stream: &mut TcpStream, base_dir: Arc<PathBuf>) -> Resul
         )
         .await?;
     } else if let Some(filename) = path.strip_prefix("/files/") {
-        let path = base_dir.join(filename);
-        let mut file = File::open(path).await.map_err(|_| HttpError::not_found())?;
-        let metadata = file.metadata().await.context("reading file metadata")?;
-        let file_length = metadata.len().to_string();
-        write_byte_stream_response(
-            stream,
-            200,
-            &[
-                ("Content-Type", "application/octet-stream"),
-                ("Content-Length", &file_length),
-            ],
-            &mut file,
-        )
-        .await?;
+        if method == "GET" {
+            let path = base_dir.join(filename);
+            let mut file = File::open(path).await.map_err(|_| HttpError::not_found())?;
+            let metadata = file.metadata().await.context("reading file metadata")?;
+            let file_length = metadata.len().to_string();
+            write_byte_stream_response(
+                stream,
+                200,
+                &[
+                    ("Content-Type", "application/octet-stream"),
+                    ("Content-Length", &file_length),
+                ],
+                &mut file,
+            )
+            .await?;
+        } else if method == "POST" {
+            let path = base_dir.join(filename);
+            let mut file = File::create(path).await.context("opening file for write")?;
+
+            tokio::io::copy_buf(stream, &mut file)
+                .await
+                .context("writing contents to file")?;
+
+            write_string_response(stream, 201, &[], None).await?;
+        } else {
+            return Err(HttpError::method_not_allowed(method));
+        }
     } else {
         println!("No routes were matched, returning 404");
         return Err(HttpError::not_found());
@@ -169,7 +211,7 @@ async fn handle_request(stream: &mut TcpStream, base_dir: Arc<PathBuf>) -> Resul
 }
 
 async fn write_string_response(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     status_code: u16,
     headers: &[(&str, &str)],
     body: Option<&str>,
@@ -179,11 +221,12 @@ async fn write_string_response(
     stream
         .write_all(format!("{body}").as_bytes())
         .await
-        .context("writing body to stream")
+        .context("writing body to stream")?;
+    stream.flush().await.context("flushing stream")
 }
 
 async fn write_byte_stream_response(
-    output_stream: &mut TcpStream,
+    output_stream: &mut (impl AsyncWrite + Unpin),
     status_code: u16,
     headers: &[(&str, &str)],
     body_stream: &mut (impl AsyncRead + Unpin),
@@ -192,11 +235,11 @@ async fn write_byte_stream_response(
     let _ = tokio::io::copy(body_stream, output_stream)
         .await
         .context("streaming byte stream to output stream")?;
-    Ok(())
+    output_stream.flush().await.context("flushing stream")
 }
 
 async fn write_response_header(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     status_code: u16,
     headers: &[(&str, &str)],
 ) -> anyhow::Result<()> {
