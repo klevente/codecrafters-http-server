@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use tokio::io::AsyncReadExt;
 pub(crate) use tokio::{
     fs::File,
     io::BufStream,
@@ -144,6 +145,8 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         headers.insert(k.trim().to_owned(), v.trim().to_owned());
     }
 
+    println!("Got {} headers", headers.len());
+
     if path == "/" {
         write_string_response(stream, 200, &[], None).await?;
     } else if let Some(sub_path) = path.strip_prefix("/echo/") {
@@ -191,10 +194,17 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
             )
             .await?;
         } else if method == "POST" {
+            let content_length = headers
+                .get("Content-Length")
+                .ok_or_else(|| HttpError::bad_request("No Content-Length was provided"))?;
+            let content_length = content_length
+                .parse::<u64>()
+                .map_err(|_| HttpError::bad_request("Content-Length is not a number"))?;
             let path = base_dir.join(filename);
             let mut file = File::create(path).await.context("opening file for write")?;
 
-            tokio::io::copy_buf(stream, &mut file)
+            let mut stream_limited = stream.take(content_length);
+            tokio::io::copy_buf(&mut stream_limited, &mut file)
                 .await
                 .context("writing contents to file")?;
 
