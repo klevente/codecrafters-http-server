@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -34,8 +35,12 @@ fn handle_request(mut stream: TcpStream) -> anyhow::Result<()> {
 
     println!("read data");
 
-    let Some((start_line, _)) = request.split_once("\r\n") else {
+    let Some((start_line, rest)) = request.split_once("\r\n") else {
         anyhow::bail!("request doesn't have a newline");
+    };
+
+    let Some((headers, _body)) = rest.split_once("\r\n\r\n") else {
+        anyhow::bail!("request doesn't have a proper split between headrees and body");
     };
 
     let Some(path) = start_line.splitn(3, ' ').nth(1) else {
@@ -44,10 +49,7 @@ fn handle_request(mut stream: TcpStream) -> anyhow::Result<()> {
 
     if path == "/" {
         write_response(&mut stream, 200, &[], None)?;
-        return Ok(());
-    }
-
-    if let Some(sub_path) = path.strip_prefix("/echo/") {
+    } else if let Some(sub_path) = path.strip_prefix("/echo/") {
         let content_length = sub_path.len().to_string();
 
         write_response(
@@ -58,6 +60,24 @@ fn handle_request(mut stream: TcpStream) -> anyhow::Result<()> {
                 ("Content-Length", &content_length),
             ],
             Some(sub_path),
+        )?;
+    } else if path == "/user-agent" {
+        let headers = headers
+            .split("\r\n")
+            .filter_map(|header| header.split_once(": "))
+            .collect::<HashMap<_, _>>();
+        let Some(user_agent) = headers.get("User-Agent") else {
+            anyhow::bail!("no user agent found");
+        };
+        let content_length = user_agent.len().to_string();
+        write_response(
+            &mut stream,
+            200,
+            &[
+                ("Content-Type", "text/plain"),
+                ("Content-Length", &content_length),
+            ],
+            Some(user_agent),
         )?;
     } else {
         println!("does not start with echo/");
