@@ -63,11 +63,6 @@ impl HttpError {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    if !args.directory.is_dir() {
-        println!("{} does not exist, exiting.", &args.directory.display());
-        return Ok(());
-    }
-
     let base_dir = Arc::new(args.directory);
 
     let listener = TcpListener::bind("127.0.0.1:4221")
