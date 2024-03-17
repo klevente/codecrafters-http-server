@@ -1,7 +1,7 @@
 use anyhow::Context;
-use std::{
-    collections::HashMap,
-    io::{Read, Write},
+use std::collections::HashMap;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
@@ -43,38 +43,43 @@ impl HttpError {
         }
     }
 
-    pub fn write_to_stream(&self, stream: &mut TcpStream) -> anyhow::Result<()> {
+    pub async fn write_to_stream(&self, stream: &mut TcpStream) -> anyhow::Result<()> {
         write_response(stream, self.status_code, &[], Some(&self.error.to_string()))
+            .await
             .context("writing http error to stream")
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:4221").context("opening socket")?;
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:4221")
+        .await
+        .context("opening socket")?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                if let Err(e) = handle_request(&mut stream) {
-                    if let Err(e) = e.write_to_stream(&mut stream) {
-                        eprintln!("Error occurred while replying with error response: {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                println!("error occurred during setting up the connection: {e}");
-            }
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => spawn_handler(stream),
+            Err(e) => println!("error occurred during setting up the connection: {e}"),
         }
     }
-
-    Ok(())
 }
 
-fn handle_request(stream: &mut TcpStream) -> Result<(), HttpError> {
+fn spawn_handler(stream: TcpStream) {
+    tokio::spawn(async move {
+        let mut stream = stream;
+        if let Err(e) = handle_request(&mut stream).await {
+            if let Err(e) = e.write_to_stream(&mut stream).await {
+                println!("Error occurred while replying with error response: {e}");
+            }
+        }
+    });
+}
+
+async fn handle_request(stream: &mut TcpStream) -> Result<(), HttpError> {
     println!("accepted new connection");
 
     let mut request = [0; 1024];
-    stream.read(&mut request).context("reading request")?;
+    stream.read(&mut request).await.context("reading request")?;
 
     let request = String::from_utf8_lossy(&request);
 
@@ -94,7 +99,7 @@ fn handle_request(stream: &mut TcpStream) -> Result<(), HttpError> {
         .ok_or_else(|| HttpError::bad_request("request doesn't have a path"))?;
 
     if path == "/" {
-        write_response(stream, 200, &[], None)?;
+        write_response(stream, 200, &[], None).await?;
     } else if let Some(sub_path) = path.strip_prefix("/echo/") {
         let content_length = sub_path.len().to_string();
 
@@ -106,7 +111,8 @@ fn handle_request(stream: &mut TcpStream) -> Result<(), HttpError> {
                 ("Content-Length", &content_length),
             ],
             Some(sub_path),
-        )?;
+        )
+        .await?;
     } else if path == "/user-agent" {
         let headers = headers
             .split("\r\n")
@@ -124,7 +130,8 @@ fn handle_request(stream: &mut TcpStream) -> Result<(), HttpError> {
                 ("Content-Length", &content_length),
             ],
             Some(user_agent),
-        )?;
+        )
+        .await?;
     } else {
         println!("does not start with echo/");
         return Err(HttpError::not_found());
@@ -135,7 +142,7 @@ fn handle_request(stream: &mut TcpStream) -> Result<(), HttpError> {
     Ok(())
 }
 
-fn write_response(
+async fn write_response(
     stream: &mut TcpStream,
     status_code: u16,
     headers: &[(&str, &str)],
@@ -145,6 +152,8 @@ fn write_response(
         .iter()
         .fold(String::new(), |acc, (k, v)| acc + &format!("{k}: {v}\r\n"));
     let body = body.unwrap_or("");
-    write!(stream, "HTTP/1.1 {status_code}\r\n{headers}\r\n{body}")
+    stream
+        .write_all(format!("HTTP/1.1 {}\r\n{}\r\n{}", status_code, headers, body).as_bytes())
+        .await
         .context("writing response to stream")
 }
