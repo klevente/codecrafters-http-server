@@ -1,11 +1,9 @@
 use anyhow::Context;
 use clap::Parser;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::io::AsyncReadExt;
-pub(crate) use tokio::{
+use tokio::{
     fs::File,
-    io::BufStream,
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream},
     net::{TcpListener, TcpStream},
 };
 
@@ -196,10 +194,9 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
         } else if method == "POST" {
             let content_length = headers
                 .get("Content-Length")
-                .ok_or_else(|| HttpError::bad_request("No Content-Length was provided"))?;
-            let content_length = content_length
-                .parse::<u64>()
-                .map_err(|_| HttpError::bad_request("Content-Length is not a number"))?;
+                .map(|v| v.parse::<u64>().ok())
+                .flatten()
+                .ok_or_else(|| HttpError::bad_request("No valid Content-Length was provided"))?;
             let path = base_dir.join(filename);
             let mut file = File::create(path).await.context("opening file for write")?;
 
