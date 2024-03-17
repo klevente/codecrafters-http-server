@@ -10,7 +10,7 @@ use tokio::{
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long, value_name = "directory")]
+    #[arg(long, value_name = "directory", default_value = "./test-files")]
     directory: PathBuf,
 }
 
