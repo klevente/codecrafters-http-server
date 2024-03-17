@@ -42,16 +42,12 @@ fn handle_request(mut stream: TcpStream) -> anyhow::Result<()> {
         anyhow::bail!("request doesn't have a path");
     };
 
-    let Some(path_without_slash) = path.strip_prefix('/') else {
-        anyhow::bail!("path doesn't start with '/'");
-    };
-
-    if path_without_slash.is_empty() {
+    if path == "/" {
         write_response(&mut stream, 200, &[], None)?;
         return Ok(());
     }
 
-    if let Some(sub_path) = path.strip_prefix("echo/") {
+    if let Some(sub_path) = path.strip_prefix("/echo/") {
         let content_length = sub_path.len().to_string();
 
         write_response(
@@ -64,6 +60,7 @@ fn handle_request(mut stream: TcpStream) -> anyhow::Result<()> {
             Some(sub_path),
         )?;
     } else {
+        println!("does not start with echo/");
         write_response(&mut stream, 404, &[], None)?;
     }
 
