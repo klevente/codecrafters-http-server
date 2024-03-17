@@ -148,10 +148,15 @@ async fn handle_request(stream: &mut TcpStream, base_dir: Arc<PathBuf>) -> Resul
     } else if let Some(filename) = path.strip_prefix("/files/") {
         let path = base_dir.join(filename);
         let mut file = File::open(path).await.map_err(|_| HttpError::not_found())?;
+        let metadata = file.metadata().await.context("reading file metadata")?;
+        let file_length = metadata.len().to_string();
         write_byte_stream_response(
             stream,
             200,
-            &[("Content-Type", "application/octet-stream")],
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Length", &file_length),
+            ],
             &mut file,
         )
         .await?;
