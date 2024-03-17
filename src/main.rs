@@ -1,20 +1,65 @@
 use anyhow::Context;
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+};
 
-/*
-GET /echo/abc HTTP/1.1
-Host: localhost:4221
-User-Agent: curl/7.64.1
- */
+#[derive(Debug)]
+struct HttpError {
+    status_code: u16,
+    error: anyhow::Error,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+impl From<anyhow::Error> for HttpError {
+    fn from(value: anyhow::Error) -> Self {
+        Self {
+            status_code: 500,
+            error: value,
+        }
+    }
+}
+
+impl HttpError {
+    pub fn bad_request(msg: &str) -> Self {
+        Self {
+            status_code: 400,
+            error: anyhow::anyhow!("Bad request: {msg}"),
+        }
+    }
+
+    pub fn not_found() -> Self {
+        Self {
+            status_code: 404,
+            error: anyhow::anyhow!("Not found"),
+        }
+    }
+
+    pub fn write_to_stream(&self, stream: &mut TcpStream) -> anyhow::Result<()> {
+        write_response(stream, self.status_code, &[], Some(&self.error.to_string()))
+            .context("writing http error to stream")
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:4221").context("opening socket")?;
 
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
-                handle_request(stream)?;
+            Ok(mut stream) => {
+                if let Err(e) = handle_request(&mut stream) {
+                    if let Err(e) = e.write_to_stream(&mut stream) {
+                        eprintln!("Error occurred while replying with error response: {e}");
+                    }
+                }
             }
             Err(e) => {
                 println!("error occurred during setting up the connection: {e}");
@@ -25,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_request(mut stream: TcpStream) -> anyhow::Result<()> {
+fn handle_request(stream: &mut TcpStream) -> Result<(), HttpError> {
     println!("accepted new connection");
 
     let mut request = [0; 1024];
@@ -35,25 +80,26 @@ fn handle_request(mut stream: TcpStream) -> anyhow::Result<()> {
 
     println!("read data");
 
-    let Some((start_line, rest)) = request.split_once("\r\n") else {
-        anyhow::bail!("request doesn't have a newline");
-    };
+    let (start_line, rest) = request
+        .split_once("\r\n")
+        .ok_or_else(|| HttpError::bad_request("request header does not contain newline"))?;
 
-    let Some((headers, _body)) = rest.split_once("\r\n\r\n") else {
-        anyhow::bail!("request doesn't have a proper split between headrees and body");
-    };
+    let (headers, _body) = rest.split_once("\r\n\r\n").ok_or_else(|| {
+        HttpError::bad_request("request doesn't have a proper split between headers and body")
+    })?;
 
-    let Some(path) = start_line.splitn(3, ' ').nth(1) else {
-        anyhow::bail!("request doesn't have a path");
-    };
+    let path = start_line
+        .splitn(3, ' ')
+        .nth(1)
+        .ok_or_else(|| HttpError::bad_request("request doesn't have a path"))?;
 
     if path == "/" {
-        write_response(&mut stream, 200, &[], None)?;
+        write_response(stream, 200, &[], None)?;
     } else if let Some(sub_path) = path.strip_prefix("/echo/") {
         let content_length = sub_path.len().to_string();
 
         write_response(
-            &mut stream,
+            stream,
             200,
             &[
                 ("Content-Type", "text/plain"),
@@ -66,12 +112,12 @@ fn handle_request(mut stream: TcpStream) -> anyhow::Result<()> {
             .split("\r\n")
             .filter_map(|header| header.split_once(": "))
             .collect::<HashMap<_, _>>();
-        let Some(user_agent) = headers.get("User-Agent") else {
-            anyhow::bail!("no user agent found");
-        };
+        let user_agent = headers
+            .get("User-Agent")
+            .ok_or_else(|| HttpError::bad_request("no user agent header in request"))?;
         let content_length = user_agent.len().to_string();
         write_response(
-            &mut stream,
+            stream,
             200,
             &[
                 ("Content-Type", "text/plain"),
@@ -81,7 +127,7 @@ fn handle_request(mut stream: TcpStream) -> anyhow::Result<()> {
         )?;
     } else {
         println!("does not start with echo/");
-        write_response(&mut stream, 404, &[], None)?;
+        return Err(HttpError::not_found());
     }
 
     println!("successfully handled request");
