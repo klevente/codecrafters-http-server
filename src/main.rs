@@ -63,7 +63,7 @@ impl HttpError {
         &self,
         stream: &mut (impl AsyncWrite + Unpin),
     ) -> anyhow::Result<()> {
-        write_string_response(stream, self.status_code, &[], Some(&self.error.to_string()))
+        write_string_response(stream, self.status_code, &[], &self.error.to_string())
             .await
             .context("writing http error to stream")
     }
@@ -125,7 +125,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
 
     println!("Incoming request: {method} {path} [{standard}]");
 
-    let mut headers = HashMap::new();
+    let mut header_lines = Vec::new();
     loop {
         let mut header_line = String::new();
         stream
@@ -137,16 +137,21 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
             break;
         }
 
-        let (k, v) = header_line
+        header_lines.push(header_line);
+    }
+
+    let mut headers = HashMap::with_capacity(header_lines.len());
+    for (i, _) in header_lines.iter().enumerate() {
+        let (k, v) = header_lines[i]
             .split_once(':')
             .ok_or_else(|| HttpError::bad_request("invalid header format"))?;
-        headers.insert(k.trim().to_owned(), v.trim().to_owned());
+        headers.insert(k.trim(), v.trim());
     }
 
     println!("Got {} headers", headers.len());
 
     if path == "/" {
-        write_string_response(stream, 200, &[], None).await?;
+        write_header_only_response(stream, 200, &[]).await?;
     } else if let Some(sub_path) = path.strip_prefix("/echo/") {
         let content_length = sub_path.len().to_string();
 
@@ -157,7 +162,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
                 ("Content-Type", "text/plain"),
                 ("Content-Length", &content_length),
             ],
-            Some(sub_path),
+            sub_path,
         )
         .await?;
     } else if path == "/user-agent" {
@@ -172,7 +177,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
                 ("Content-Type", "text/plain"),
                 ("Content-Length", &content_length),
             ],
-            Some(user_agent),
+            user_agent
         )
         .await?;
     } else if let Some(filename) = path.strip_prefix("/files/") {
@@ -205,7 +210,7 @@ async fn handle_request<S: AsyncRead + AsyncWrite + Unpin>(
                 .await
                 .context("writing contents to file")?;
 
-            write_string_response(stream, 201, &[], None).await?;
+            write_header_only_response(stream, 201, &[]).await?;
         } else {
             return Err(HttpError::method_not_allowed(method));
         }
@@ -221,12 +226,10 @@ async fn write_string_response(
     stream: &mut (impl AsyncWrite + Unpin),
     status_code: u16,
     headers: &[(&str, &str)],
-    body: Option<&str>,
+    body: &str,
 ) -> anyhow::Result<()> {
-    write_response_header(stream, status_code, headers).await?;
-    let body = body.unwrap_or("");
-    stream
-        .write_all(format!("{body}").as_bytes())
+    write_header_only_response(stream, status_code, headers).await?;
+    stream.write_all(body.as_bytes())
         .await
         .context("writing body to stream")?;
     stream.flush().await.context("flushing stream")
@@ -238,24 +241,30 @@ async fn write_byte_stream_response(
     headers: &[(&str, &str)],
     body_stream: &mut (impl AsyncRead + Unpin),
 ) -> anyhow::Result<()> {
-    write_response_header(output_stream, status_code, headers).await?;
+    write_header_only_response(output_stream, status_code, headers).await?;
     let _ = tokio::io::copy(body_stream, output_stream)
         .await
         .context("streaming byte stream to output stream")?;
     output_stream.flush().await.context("flushing stream")
 }
 
-async fn write_response_header(
+async fn write_header_only_response(
     stream: &mut (impl AsyncWrite + Unpin),
     status_code: u16,
     headers: &[(&str, &str)],
 ) -> anyhow::Result<()> {
-    let headers = headers
-        .iter()
-        .fold(String::new(), |acc, (k, v)| acc + &format!("{k}: {v}\r\n"));
+    let status_code = status_code.to_string();
 
-    stream
-        .write_all(format!("HTTP/1.1 {}\r\n{}\r\n", status_code, headers).as_bytes())
-        .await
-        .context("writing header to stream")
+    stream.write_all(b"HTTP/1.1 ").await.context("writing http standard to stream")?;
+    stream.write_all(status_code.as_bytes()).await.context("writing status code to stream")?;
+    stream.write_all(b"\r\n").await.context("writing first newline to stream")?;
+
+    for (k, v) in headers {
+        stream.write_all(k.as_bytes()).await.context("writing header key to stream")?;
+        stream.write_all(b": ").await.context("writing header separator to stream")?;
+        stream.write_all(v.as_bytes()).await.context("writing header value to stream")?;
+        stream.write_all(b"\r\n").await.context("writing header newline to stream")?;
+    }
+
+    stream.write_all(b"\r\n").await.context("writing final header newline to stream")
 }
