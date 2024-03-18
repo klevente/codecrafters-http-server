@@ -14,6 +14,24 @@ struct Args {
     directory: PathBuf,
 }
 
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    let base_dir = Arc::new(args.directory);
+
+    let listener = TcpListener::bind("127.0.0.1:4221")
+        .await
+        .context("opening socket")?;
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => spawn_handler(BufStream::new(stream), base_dir.clone()),
+            Err(e) => println!("error occurred during setting up the connection: {e}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct HttpError {
     status_code: u16,
@@ -66,24 +84,6 @@ impl HttpError {
         write_string_response(stream, self.status_code, &[], &self.error.to_string())
             .await
             .context("writing http error to stream")
-    }
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    let base_dir = Arc::new(args.directory);
-
-    let listener = TcpListener::bind("127.0.0.1:4221")
-        .await
-        .context("opening socket")?;
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => spawn_handler(BufStream::new(stream), base_dir.clone()),
-            Err(e) => println!("error occurred during setting up the connection: {e}"),
-        }
     }
 }
 
